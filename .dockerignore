@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.xlsx
+*.xls
+.vscode/
+.venv/
+.git/
+.gitignore

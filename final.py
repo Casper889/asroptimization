@@ -203,6 +203,7 @@ with st.sidebar:
     alpha_name = st.text_input("Portfolio-tabblad", value="alpha")
     core_name  = st.text_input("Benchmark-tabblad", value="core")
     st.caption("We gebruiken kolommen met *Peer Rank* (lager is beter), omgezet naar 0–1 waarden (ontbrekend = 50).")
+    
 
 cols = st.columns([1,5])
 with cols[1]:
