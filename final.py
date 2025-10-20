@@ -338,6 +338,14 @@ with tab3:
             if ind_col is None and "gics industry" in cl:
                 ind_col = c
         return sect_col, ind_col
+    
+    def _find_fx_col(df: pd.DataFrame):
+        fx_col = None
+        for c in df.columns:
+            cl = str(c).lower()
+            if fx_col is None and ("currency" in cl or "crncy" in cl):
+                fx_col = c
+        return fx_col
 
     def group_exposure(df: pd.DataFrame, wcol: str, gcol: str) -> pd.Series:
         s = df[[gcol, wcol]].dropna().groupby(gcol, dropna=True)[wcol].sum()
@@ -375,6 +383,10 @@ with tab3:
             dfw = dfw.drop(columns=["w_b"]).merge(bench, on="Ticker", how="left").fillna({"w_b":0.0})
 
         tickers = dfw["Ticker"].tolist()
+
+        frozen = st.multiselect("Bevries weight voor deze tickers (keep = initial portfolio weight)",
+                        tickers, default=[])
+
         N = len(tickers)
 
         # Eenvoudig bewerkbaar Conviction-overzicht
@@ -404,13 +416,15 @@ with tab3:
             long_only = st.checkbox("Long-only", True)
         hard_lb = st.checkbox("Harde ondergrens: w ≥ w_bench", True)
 
+
         # Regularization (hardcoded)
         lam_eq = 100
 
         # Bands t.o.v. Benchmark
         sect_col, ind_col = _find_gics_cols(alpha)
+        fx_col = _find_fx_col(alpha)
         st.markdown("**Bands vs Benchmark**")
-        g1, g2 = st.columns(2)
+        g1, g2, g3 = st.columns(3)
         with g1:
             use_sector = st.checkbox("Pas GICS Sector bands toe", value=False, disabled=(sect_col is None))
             band_sector = st.slider("Sector band (±%)", 0.0, 50.0, 10.0, 1.0, disabled=not use_sector) / 100.0
@@ -421,6 +435,12 @@ with tab3:
             band_ind = st.slider("Industry band (±%)", 0.0, 50.0, 10.0, 1.0, disabled=not use_industry) / 100.0
             if ind_col is None:
                 st.caption("_GICS Industry-kolom niet gevonden in het Portfolio-tabblad._")
+        with g3:
+            use_fx = st.checkbox("FX currency bands", value=False, disabled=(fx_col is None))
+            band_fx = st.slider("FX band (±%)", 0.0, 50.0, 10.0, 1.0, disabled=not use_fx) / 100.0
+            if fx_col is None:
+                st.caption("_Currency column not found in Portfolio tab._")
+
 
         run_opt = st.button("Run Optimizer", key="btn_run_opt")
 
@@ -469,6 +489,9 @@ with tab3:
 
             bench_sector_share   = bench_group_share(core_full, c_sect) if c_sect else {}
             bench_industry_share = bench_group_share(core_full, c_ind)  if c_ind  else {}
+            c_fx = _find_fx_col(core)
+            bench_fx_share       = bench_group_share(core_full, c_fx)   if c_fx   else {}
+
 
             # Sector-bands
             if use_sector and a_sect and c_sect:
@@ -492,20 +515,80 @@ with tab3:
                     cons.append({"type":"ineq", "fun": lambda w, m=m, lo=lo: (m @ w) - lo})
                     cons.append({"type":"ineq", "fun": lambda w, m=m, up=up: up - (m @ w)})
 
-            # Namen-bounds + active caps
+            # FX currency bands
+            if use_fx and fx_col and c_fx:
+                fx_ser = alpha.set_index("Ticker")[fx_col].reindex(tickers).fillna("NA")
+                for cur in sorted(fx_ser.unique()):
+                    m = (fx_ser == cur).to_numpy().astype(float)
+                    wbg = float(bench_fx_share.get(cur, 0.0))
+                    lo = wbg - band_fx
+                    up = wbg + band_fx
+                    cons.append({"type":"ineq", "fun": lambda w, m=m, lo=lo: (m @ w) - lo})
+                    cons.append({"type":"ineq", "fun": lambda w, m=m, up=up:  up - (m @ w)})
+
+
+            if hard_lb:
+                bad = [t for t, w_i, wb_i in zip(tickers, w0, w_b) if (t in frozen and w_i < wb_i - 1e-12)]
+                if bad:
+                    st.warning(
+                        "Harde ondergrends (w ≥ w_bench) conflict met frozen underweights voor: "
+                        + ", ".join(bad)
+                        + ". Ignoring hard_lb voor frozen names."
+                    )
+
+
             bounds = []
             for i in range(N):
+                if tickers[i] in frozen:
+                    # frozen: allow negative active; no hard_lb, no per-name active caps
+                    bounds.append((float(w0[i]), float(w0[i])))
+                    continue
+
                 lb = 0.0 if long_only else -max_abs_w
                 if hard_lb:
-                    lb = max(lb, float(w_b[i]))
+                    lb = max(lb, float(w_b[i]))  # only for non-frozen names
                 ub = max_abs_w
                 bounds.append((lb, ub))
+
+                # per-name active band only for non-frozen:
                 cons.append({"type":"ineq", "fun": lambda w, i=i:  max_active_w -  (w[i] - w_b[i])})
                 cons.append({"type":"ineq", "fun": lambda w, i=i:  max_active_w +  (w[i] - w_b[i])})
 
+
+            # Build arrays of lb/ub from bounds
+            lb_arr = np.array([b[0] for b in bounds], dtype=float)
+            ub_arr = np.array([b[1] for b in bounds], dtype=float)
+
+            # Start from w0, clipped to bounds
+            x0 = np.clip(w0, lb_arr, ub_arr)
+
+            # Ensure sum-to-1 while respecting bounds (adjust only non-frozen vars)
+            free = ~(np.isclose(lb_arr, ub_arr))   # True if not frozen
+            resid = 1.0 - x0.sum()
+
+            if abs(resid) > 1e-12 and free.any():
+                if resid > 0:
+                    # add weight to free vars up to their remaining headroom
+                    room_up = (ub_arr - x0) * free
+                    total_room = room_up.sum()
+                    if total_room < resid - 1e-12:
+                        st.error("Infeasible: not enough upper-bound room to reach sum=1 with current freezes/bands.")
+                    else:
+                        x0 += np.where(free, resid * (room_up / total_room), 0.0)
+                else:
+                    # remove weight from free vars down to their lower bounds
+                    room_down = (x0 - lb_arr) * free
+                    total_room = room_down.sum()
+                    if total_room < (-resid) - 1e-12:
+                        st.error("Infeasible: not enough lower-bound room to achieve sum=1 with current freezes/bands.")
+                    else:
+                        x0 -= np.where(free, (-resid) * (room_down / total_room), 0.0)
+
+                    # After you have tickers, w0, w_b, and 'frozen'
+
             res = minimize(
                 objective,
-                x0=np.clip(w0, 0, max_abs_w),
+                x0=x0,
                 method="SLSQP",
                 bounds=bounds,
                 constraints=cons,
@@ -538,14 +621,22 @@ with tab3:
 
             # opt_df inclusief GICS-kolommen (voor latere grafieken)
             opt_df = alpha.set_index("Ticker").reindex(tickers).reset_index()[["Ticker"] + factor_cols].copy()
-            if sect_col is not None and sect_col in alpha.columns:
+
+            # Add GICS and FX columns if present
+            if sect_col and sect_col in alpha.columns:
                 opt_df[sect_col] = alpha.set_index("Ticker")[sect_col].reindex(tickers).values
-            if ind_col is not None and ind_col in alpha.columns:
+            if ind_col and ind_col in alpha.columns:
                 opt_df[ind_col] = alpha.set_index("Ticker")[ind_col].reindex(tickers).values
+            fx_col = _find_fx_col(alpha)
+            if fx_col and fx_col in alpha.columns:
+                opt_df[fx_col] = alpha.set_index("Ticker")[fx_col].reindex(tickers).values
+
+            # Add optimized weights
             opt_df["w_opt"] = w_opt
             tot = float(opt_df["w_opt"].sum())
             if tot > 0:
                 opt_df["w_opt"] = opt_df["w_opt"] / tot
+
             exp_opt = compute_weighted_exposures(opt_df.rename(columns={"w_opt":"w"}), "w", factor_cols)
 
             ai_raw = exp_init - exp_bench_full
@@ -570,12 +661,6 @@ with tab3:
                 ai = ai / sds
                 ao = ao / sds
 
-            # Hardcoded Momentum boost ×2 (alleen visueel)
-            for name in ai.index:
-                if "moment" in name.lower():
-                    ai.loc[name] *= 2.0
-                    ao.loc[name] *= 2.0
-
             st.subheader("Active exposures — Initieel vs Optimized (zelfde grafiek)")
             st.plotly_chart(
                 make_active_compare_bar_from_actives(ai, ao, "Active (Initial) vs Active (Optimized)"),
@@ -595,6 +680,7 @@ with tab3:
                     if ind_col_ is None and "gics industry" in cl:
                         ind_col_ = c
                 return sect_col_, ind_col_
+
 
             a_sect2, a_ind2 = _find_gics_cols_in(opt_df)
             c_sect, c_ind   = _find_gics_cols(core)
@@ -622,6 +708,19 @@ with tab3:
                     use_container_width=True,
                     key="plt_ind_opt"
                 )
+
+            # FX exposures vs Benchmark (Optimized)
+            fx_col_opt = _find_fx_col(opt_df)
+            c_fx = _find_fx_col(core_norm)
+            if fx_col_opt and c_fx and fx_col_opt in opt_df.columns and c_fx in core_norm.columns:
+                p_fx = group_exposure(opt_df, "w_opt", fx_col_opt)
+                b_fx = group_exposure(core_norm, c_wcol, c_fx)
+                st.plotly_chart(
+                    make_group_bar(p_fx, b_fx, "FX currency exposure vs Benchmark (Optimized)"),
+                    use_container_width=True,
+                    key="plt_fx_opt"
+                )
+
 
             # ---------- Suggesties ----------
             st.subheader("Suggesties uit de Benchmark die de doel-Exposure helpen")
